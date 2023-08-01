@@ -4,6 +4,7 @@ import pyarrow.parquet as pq
 import os
 from collections import Counter
 from pyproj import Transformer
+import matplotlib.pyplot as plt
 
 # DIRECTORY PATH
 RAW_FLOW_DIRECTORY = "raw_data/flow"
@@ -25,6 +26,11 @@ RAW_FLOW_COLS_NAMES = [
     "avg_occupancy",
     "avg_speed",
 ]
+
+
+def load_files(data_dir: str):
+    # raw_flow_data =
+    pass
 
 
 # function to transfer the csv to parquet
