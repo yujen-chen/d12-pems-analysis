@@ -250,6 +250,8 @@ $RECYCLE.BIN/
 # Windows shortcuts
 *.lnk
 
+# unit-test-file
+test_functions.py
 
 
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,macos,windows

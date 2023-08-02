@@ -1,10 +1,12 @@
 import pandas as pd
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import os
 from collections import Counter
 from pyproj import Transformer
 import matplotlib.pyplot as plt
+import re
 
 # DIRECTORY PATH
 RAW_FLOW_DIRECTORY = "raw_data/flow"
@@ -27,10 +29,44 @@ RAW_FLOW_COLS_NAMES = [
     "avg_speed",
 ]
 
+"""
+Load Parquet Data
+"""
 
-def load_files(data_dir: str):
-    # raw_flow_data =
-    pass
+
+def load_parquet_data(data_dir_path: str):
+    # define all the folders
+    parquet_flow_dir = os.path.join(data_dir_path, "flow")
+    parquet_station_dir = os.path.join(data_dir_path, "station_meta")
+    parquet_pm_dir = os.path.join(data_dir_path, "pm")
+    parquet_flow_data = os.listdir(parquet_flow_dir)
+    parquet_station_data = os.listdir(parquet_station_dir)
+    parquet_pm_data = os.listdir(parquet_pm_dir)
+
+    # flow dict
+    raw_flow_dfs = {}
+    for flow_parquet in parquet_flow_data:
+        parquet_flow_key = (
+            flow_parquet[:3] + "_" + re.search(r"\d{8}", flow_parquet).group()
+        )
+        raw_flow_dfs[parquet_flow_key] = pd.read_parquet(
+            os.path.join(parquet_flow_dir, flow_parquet)
+        )
+
+    # station_df
+    station_df = pd.read_parquet(
+        os.path.join(parquet_station_dir, parquet_station_data[0])
+    )
+
+    # pm_df
+    pm_df = pd.read_parquet(os.path.join(parquet_pm_dir, parquet_pm_data[0]))
+
+    return raw_flow_dfs, station_df, pm_df
+
+
+"""
+Load csv raw data and save as parquet
+"""
 
 
 # function to transfer the csv to parquet
@@ -118,11 +154,6 @@ def raw_flow_to_parquet(gz_flow_dir: str, parquet_flow_dir: str) -> dict:
     return raw_flow_dfs
 
 
-"""
-Load the station meta data
-"""
-
-
 def tweak_station_meta(
     raw_station_dir: str, year: int, raw_flow_df: pd.DataFrame, parquet_station_dir: str
 ) -> pd.DataFrame:
@@ -165,6 +196,10 @@ def tweak_station_meta(
         delimiter="\t",
         usecols=raw_station_cols,
     )
+
+    # round abs_pm to two decimal places
+    raw_station_df["Abs_PM"] = raw_station_df["Abs_PM"].round(2)
+
     sdf_col_names = [
         "station",
         "freeway_num",
@@ -216,12 +251,19 @@ def tweak_pm_df(raw_pm_dir: str, parquet_pm_dir: str) -> pd.DataFrame:
     # drop original X and Y
     raw_pm_df = raw_pm_df.drop(["X", "Y"], axis=1)
 
+    # Keep AlignCode only for left and drop AlignCode
+    raw_pm_df = raw_pm_df[raw_pm_df["AlignCode"] == "Left"].drop(
+        columns=["AlignCode"], axis=1
+    )
+
+    # Round PM column to two decimal place
+    raw_pm_df["PM"] = raw_pm_df["PM"].round(2)
+
     # rename columns
     pm_cols_name = [
         "freeway_num",
         "district",
         "abs_pm",
-        "aligncode",
         "latitude",
         "longitude",
     ]
@@ -232,3 +274,176 @@ def tweak_pm_df(raw_pm_dir: str, parquet_pm_dir: str) -> pd.DataFrame:
     raw_pm_df.to_parquet(os.path.join(parquet_pm_dir, parquet_pm_name))
 
     return raw_pm_df
+
+
+"""
+Tweak flow data
+
+- Loop through the raw_flow_dict
+- Select the route
+-
+"""
+
+
+# select route from raw_flow_dict
+def select_route(
+    raw_flow_df: pd.DataFrame,
+    freeway_num: int,
+    direction: str,
+    lane_type: str,
+) -> pd.DataFrame:
+    """
+    This function extracts raw flow data for input route from raw flow dictionary
+    and save it as dictionary
+    """
+
+    required_columns_before = {"freeway_num", "direction", "lane_type"}
+
+    required_columns_after = {
+        "timestamp",
+        "station",
+        "district",
+        "freeway_num",
+        "direction",
+        "lane_type",
+        "station_length",
+        "samples",
+        "pct_observed",
+        "total_flow",
+        "avg_occupancy",
+        "avg_speed",
+    }
+
+    # copy the input data
+    df = raw_flow_df.copy()
+
+    # use assert to check the required columns
+    assert required_columns_before.issubset(
+        df.columns
+    ), f"{key} is missing some required columns before processing"
+
+    # filter the df based on route number, direction, and lane type
+    df = df.query(
+        "freeway_num == @freeway_num & direction == @direction & lane_type == @lane_type"
+    )
+
+    # sort by timestamp then reset index
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    assert df.shape[1] == 12, "The columns of route df is wrong"
+
+    assert required_columns_after.issubset(
+        df.columns
+    ), f"Some columns are not included in {key}, check raw data"
+
+    return df
+
+
+# assign null pivot and merge with sdf
+def process_flow_merge_sdf(
+    route_flow_df: pd.DataFrame, sdf: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    This function does the following:
+    - Assign NaN to flow if the 'pct_observed' is less than 70
+    - Pivot the raw df with index=station, columns=timestamp, values=total_flow
+    - Drop the row if the row includes more than 50% of NaN
+    - Merge with sdf so the flow_df has pm
+    """
+
+    # backup input data
+    df = route_flow_df.copy()
+    sdf_copy = sdf[["station", "abs_pm"]].copy()
+
+    # rename the columns for pivot df
+    pivot_col_names = [
+        f"{hour:02d}{minute:02d}" for hour in range(0, 24) for minute in range(0, 60, 5)
+    ]
+    pivot_col_names.insert(0, "station")
+
+    # required columns before process
+    required_columns_before = {"pct_observed", "total_flow", "timestamp", "station"}
+
+    # check the columns
+    assert required_columns_before.issubset(
+        df.columns
+    ), f"{key} is missing some required columns."
+    assert (
+        df["freeway_num"].nunique() == 1
+    ), f"{key} should have only one unique value in the 'station' column."
+    assert (
+        df["direction"].nunique() == 1
+    ), f"{key} should have only one unique value in the 'station' column."
+    assert (
+        df["lane_type"].nunique() == 1
+    ), f"{key} should have only one unique value in the 'station' column."
+
+    # filter flow_df and assign NaN
+    pct_observed_mask = df["pct_observed"] < 70
+    df.loc[pct_observed_mask, "total_flow"] = np.nan
+
+    # pivot df, each row is a station and each column is 5-min interval
+    df = df.pivot(
+        index="station", columns="timestamp", values="total_flow"
+    ).reset_index()
+
+    # if the whole row are NaN values, drop it
+    drop_raw_threshold = len(df.columns) * 0
+    # drop the raw if the row has at least two NaN values (one for station and one for flow)
+    df = df.dropna(thresh=2)
+
+    # rename the columns
+    df.columns = pivot_col_names
+
+    # merge with sdf
+    df = pd.merge(
+        df,
+        sdf_copy,
+        on="station",
+        how="left",
+    )
+
+    # sort by abs_pm then reset index
+    df = df.sort_values("abs_pm").reset_index(drop=True)
+
+    return df
+
+
+# Merge with pm and Interpolation
+
+
+def process_flow_interpolation(
+    flow_df: pd.DataFrame, pmdf: pd.DataFrame, district: int, route: int
+):
+    df = flow_df.copy()
+    # filter pmdf
+    route_pm = (
+        pmdf.query("district==@district & freeway_num==@route")
+        .sort_values("abs_pm")
+        .reset_index(drop=True)
+    )
+
+    # create a list of bins that will be used for PM range later
+    bins = [0] + route_pm["abs_pm"].tolist() + [np.inf]
+
+    # append the bins to route_merged_df
+    df["abs_pm_range"] = pd.cut(df["abs_pm"], bins=bins)
+
+    # calculate mean flow
+    df = df.iloc[:, 1:].groupby("abs_pm_range").mean().reset_index().iloc[:, 0:-1]
+
+    # delete the last row (last_pm, np.inf]
+    df = df.drop(df.index[-1])
+
+    # check if rows of route_mean_flow and pm_df are the same
+    if len(df) == len(route_pm):
+        df = route_pm.merge(df, left_index=True, right_index=True)
+
+        # forward fillna for pm within route_flow_range, back fillna beyound route_flow_range
+        df = df.fillna(method="bfill", axis=0).fillna(method="ffill", axis=0)
+
+        # interpolate nan across columns (across time)
+        df.iloc[:, 6:-1] = df.iloc[:, 6:-1].interpolate(axis=1).round(0)
+        return df
+    else:
+        return "Error, check input dfs"
