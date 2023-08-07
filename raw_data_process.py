@@ -30,6 +30,12 @@ RAW_FLOW_COLS_NAMES = [
 ]
 
 """
+# TODO:
+
+"""
+
+
+"""
 Load Parquet Data
 """
 
@@ -43,6 +49,14 @@ def load_parquet_data(data_dir_path: str):
     parquet_station_data = os.listdir(parquet_station_dir)
     parquet_pm_data = os.listdir(parquet_pm_dir)
 
+    # station_df
+    station_df = pd.read_parquet(
+        os.path.join(parquet_station_dir, parquet_station_data[0])
+    )
+
+    # pm_df
+    pm_df = pd.read_parquet(os.path.join(parquet_pm_dir, parquet_pm_data[0]))
+
     # flow dict
     raw_flow_dfs = {}
     for flow_parquet in parquet_flow_data:
@@ -53,13 +67,22 @@ def load_parquet_data(data_dir_path: str):
             os.path.join(parquet_flow_dir, flow_parquet)
         )
 
-    # station_df
-    station_df = pd.read_parquet(
-        os.path.join(parquet_station_dir, parquet_station_data[0])
-    )
+        assert (
+            pd.Series(raw_flow_dfs[parquet_flow_key]["station"].unique())
+            .isin(station_df["station"])
+            .all()
+        ), "station list mismatch"
 
-    # pm_df
-    pm_df = pd.read_parquet(os.path.join(parquet_pm_dir, parquet_pm_data[0]))
+        raw_flow_dfs[parquet_flow_key] = pd.merge(
+            raw_flow_dfs[parquet_flow_key],
+            station_df[["station", "abs_pm"]],
+            on="station",
+            how="left",
+        )
+
+        assert (raw_flow_dfs[parquet_flow_key]["station"].isnull().sum() == 0) & (
+            raw_flow_dfs[parquet_flow_key]["abs_pm"].isnull().sum() == 0
+        ), "station and/or abs-pm mismatch"
 
     return raw_flow_dfs, station_df, pm_df
 
@@ -277,10 +300,10 @@ def tweak_pm_df(raw_pm_dir: str, parquet_pm_dir: str) -> pd.DataFrame:
 
 
 """
-Tweak flow data
+Flow data handling
 
-- Loop through the raw_flow_dict
 - Select the route
+- Assign NaN values and merge with station df to get abs-pm info
 -
 """
 
@@ -330,7 +353,7 @@ def select_route(
     # sort by timestamp then reset index
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    assert df.shape[1] == 12, "The columns of route df is wrong"
+    assert df.shape[1] == 13, "The columns of route df is wrong"
 
     assert required_columns_after.issubset(
         df.columns
@@ -340,29 +363,32 @@ def select_route(
 
 
 # assign null pivot and merge with sdf
-def process_flow_merge_sdf(
-    route_flow_df: pd.DataFrame, sdf: pd.DataFrame
-) -> pd.DataFrame:
+def process_flow(route_flow_df: pd.DataFrame) -> pd.DataFrame:
     """
     This function does the following:
     - Assign NaN to flow if the 'pct_observed' is less than 70
-    - Pivot the raw df with index=station, columns=timestamp, values=total_flow
+    - Pivot the raw df with index=[station, abs_pm], columns=timestamp, values=total_flow
     - Drop the row if the row includes more than 50% of NaN
-    - Merge with sdf so the flow_df has pm
     """
 
     # backup input data
     df = route_flow_df.copy()
-    sdf_copy = sdf[["station", "abs_pm"]].copy()
+    # sdf_copy = sdf[["station", "abs_pm"]].copy()
 
     # rename the columns for pivot df
     pivot_col_names = [
         f"{hour:02d}{minute:02d}" for hour in range(0, 24) for minute in range(0, 60, 5)
     ]
-    pivot_col_names.insert(0, "station")
+    pivot_col_names = ["station", "abs_pm"] + pivot_col_names
 
     # required columns before process
-    required_columns_before = {"pct_observed", "total_flow", "timestamp", "station"}
+    required_columns_before = {
+        "pct_observed",
+        "total_flow",
+        "timestamp",
+        "station",
+        "abs_pm",
+    }
 
     # check the columns
     assert required_columns_before.issubset(
@@ -383,39 +409,31 @@ def process_flow_merge_sdf(
     df.loc[pct_observed_mask, "total_flow"] = np.nan
 
     # pivot df, each row is a station and each column is 5-min interval
-    df = df.pivot(
-        index="station", columns="timestamp", values="total_flow"
+    _p_df = df.pivot(
+        index=["station", "abs_pm"], columns="timestamp", values="total_flow"
     ).reset_index()
 
     # if the whole row are NaN values, drop it
     drop_raw_threshold = len(df.columns) * 0
-    # drop the raw if the row has at least two NaN values (one for station and one for flow)
-    df = df.dropna(thresh=2)
+    # drop the raw if the row has at least three non-NaN values (two for station, abs_pm, and one for flow)
+    _p_df = _p_df.dropna(thresh=3)
 
     # rename the columns
-    df.columns = pivot_col_names
-
-    # merge with sdf
-    df = pd.merge(
-        df,
-        sdf_copy,
-        on="station",
-        how="left",
-    )
+    _p_df.columns = pivot_col_names
 
     # sort by abs_pm then reset index
-    df = df.sort_values("abs_pm").reset_index(drop=True)
+    _p_df = _p_df.sort_values("abs_pm").reset_index(drop=True)
 
-    return df
+    return _p_df
 
 
 # Merge with pm and Interpolation
 
 
-def process_flow_interpolation(
+def flow_interpolation(
     flow_df: pd.DataFrame, pmdf: pd.DataFrame, district: int, route: int
 ):
-    df = flow_df.copy()
+    _df = flow_df.copy()
     # filter pmdf
     route_pm = (
         pmdf.query("district==@district & freeway_num==@route")
@@ -427,23 +445,31 @@ def process_flow_interpolation(
     bins = [0] + route_pm["abs_pm"].tolist() + [np.inf]
 
     # append the bins to route_merged_df
-    df["abs_pm_range"] = pd.cut(df["abs_pm"], bins=bins)
+    _df = _df.sort_values("abs_pm").reset_index(drop=True)
+    _df["abs_pm_range"] = pd.cut(_df["abs_pm"], bins=bins)
 
     # calculate mean flow
-    df = df.iloc[:, 1:].groupby("abs_pm_range").mean().reset_index().iloc[:, 0:-1]
+    time_col_names = [
+        f"{hour:02d}{minute:02d}" for hour in range(0, 24) for minute in range(0, 60, 5)
+    ]
+    col_names = ["abs_pm_range"] + time_col_names
+    _mean_flow_df = _df[col_names].groupby("abs_pm_range").mean().reset_index(drop=True)
 
     # delete the last row (last_pm, np.inf]
-    df = df.drop(df.index[-1])
+    _mean_flow_df = _mean_flow_df.drop(_mean_flow_df.index[-1])
 
     # check if rows of route_mean_flow and pm_df are the same
-    if len(df) == len(route_pm):
-        df = route_pm.merge(df, left_index=True, right_index=True)
+    if len(_mean_flow_df) == len(route_pm):
+        _res_df = route_pm.merge(_mean_flow_df, left_index=True, right_index=True)
 
         # forward fillna for pm within route_flow_range, back fillna beyound route_flow_range
-        df = df.fillna(method="bfill", axis=0).fillna(method="ffill", axis=0)
+        _res_df = _res_df.fillna(method="bfill", axis=0).fillna(method="ffill", axis=0)
+
+        # save non-interpolation df
+        _res_non_int_df = _res_df.copy()
 
         # interpolate nan across columns (across time)
-        df.iloc[:, 6:-1] = df.iloc[:, 6:-1].interpolate(axis=1).round(0)
-        return df
+        _res_df[time_col_names] = _res_df[time_col_names].interpolate(axis=1).round(0)
+        return _res_non_int_df, _res_df
     else:
         return "Error, check input dfs"
